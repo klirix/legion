@@ -2,14 +2,15 @@ package main
 
 import (
 	"archive/zip"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"path"
 
 	"github.com/docker/distribution/uuid"
 )
@@ -24,55 +25,45 @@ const uploadDir = `legion/uploads/`
 
 func main() {
 
-	// Hello world, the web server
-
-	// ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
-	// defer cancel()
-
-	// docker, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	// if err != nil {
-	// 	panic(err)
-	// }
-
-	// services, err := docker.ServiceList(ctx, types.ServiceListOptions{})
-	// if err != nil {
-	// 	log.Print("Failed to fetch containers")
-	// 	panic(err)
-	// }
-
-	// for _, service := range services {
-	// 	log.Printf("%s %s", service.Spec.Name, service.ID)
-	// }
+	// cli, err := client.NewClientWithOpts(client.FromEnv)
 
 	http.HandleFunc("/hello", func(w http.ResponseWriter, req *http.Request) {
-		uuid := uuid.Generate().String()
-		bytes, err := io.ReadAll(req.Body)
-		print(len(bytes))
+		uploadFile, err := grabTempFile(req)
 		if err != nil {
-			fmt.Fprintf(w, "Failed to read body")
+			fmt.Fprintf(w, "Failed to persist temp file, "+err.Error())
 			return
 		}
-		os.MkdirAll(uploadDir, fs.ModePerm)
-		uploadFile := fmt.Sprintf("%s/%s.zip", uploadDir, uuid)
-		err = ioutil.WriteFile(uploadFile, bytes, fs.ModePerm)
-		// defer os.Remove(uploadFile)
-		if err != nil {
-			fmt.Fprintf(w, "Failed to write to file")
-			return
-		}
-
+		defer os.Remove(uploadFile)
 		archive, err := zip.OpenReader(uploadFile)
 		if err != nil {
 			fmt.Fprintf(w, "failed to open zip")
 			return
 		}
-		defer archive.Close()
 
-		err = checkLegionManifest(archive)
+		manifest, err := checkLegionManifest(archive)
 		if err != nil {
-			fmt.Fprintf(w, "legion manifest not found")
+			fmt.Fprint(w, err.Error())
 			return
 		}
+
+		for _, file := range archive.File {
+			os.MkdirAll("legion/builds", fs.ModePerm)
+			ofile, erro := os.Create(path.Join("legion/builds", file.Name))
+			if erro != nil {
+				fmt.Fprint(w, "Failed to open files: "+erro.Error())
+				return
+			}
+			ifile, erri := file.Open()
+			if erri != nil {
+				fmt.Fprint(w, "Failed to open files: "+erri.Error())
+				return
+			}
+			io.Copy(ofile, ifile)
+		}
+
+		fmt.Printf("%#v", manifest)
+
+		// cli.ImageBuild(context.TODO())
 
 		fmt.Fprintf(w, "ok")
 	})
@@ -81,11 +72,54 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8000", nil))
 }
 
-func checkLegionManifest(archive *zip.ReadCloser) error {
-	for _, file := range archive.File {
-		if file.Name == "legion.json" {
-			return nil
-		}
+func grabTempFile(req *http.Request) (uploadFile string, err error) {
+	uuid := uuid.Generate().String()
+	uploadFile = ""
+	reader, err := req.MultipartReader()
+	if err != nil {
+		return
 	}
-	return errors.New("Legion manifest not found")
+	form, err := reader.ReadForm(1 << 32)
+	if err != nil {
+		return
+	}
+
+	os.MkdirAll(uploadDir, fs.ModePerm)
+	if err != nil {
+		return
+	}
+	fileIn, err := form.File["file"][0].Open()
+	if err != nil {
+		return
+	}
+
+	uploadFile = path.Join(uploadDir, uuid+".zip")
+	fileOut, err := os.Create(uploadFile)
+	if err != nil {
+		return
+	}
+
+	_, err = io.Copy(fileOut, fileIn)
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func checkLegionManifest(archive *zip.ReadCloser) (LegionDeploymentConfig, error) {
+	manifest := LegionDeploymentConfig{}
+	for _, file := range archive.File {
+		if file.Name != "legion.json" {
+			continue
+		}
+		manifestFile, err := file.Open()
+		if err != nil {
+			return manifest, err
+		}
+		decoder := json.NewDecoder(manifestFile)
+		decoder.Decode(&manifest)
+		return manifest, nil
+	}
+	return manifest, errors.New("legion manifest not found")
 }
